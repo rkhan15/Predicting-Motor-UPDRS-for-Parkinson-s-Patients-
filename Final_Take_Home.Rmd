@@ -1,0 +1,376 @@
+---
+title: "Final Exam Take-Home Project"
+author: "Raiha Khan"
+date: "May 4, 2018"
+output:
+  html_document:
+    toc: yes
+  word_document:
+    toc: yes
+subtitle: Math 478 -  Introduction to Statistical Methods in Data Science
+---
+
+# I. Introduction
+
+Parkinson's disease (PD) is a neurodegenerative disorder that affects predominately dopamine-producing ("dopaminergic") neurons in a specific area of the brain called substantia nigra. Although there is no cure for the disease yet, medications, surgery and multidisciplinary management can provide relief from the symptoms.
+
+Patients with Parkinson's disease face the difficulty of not being able to visit their clinic as often as they should for monitoring and treatment. As a result, remote telemonitoring is conducted on patients to reduce the costs and the inconvenience of physical visits.
+
+# II. Data Sources
+This data set was created by Athanasios Tsanas and Max Little of the University of Oxford, in collaboration with 10 medical centers in the US and Intel Corporation who developed the telemonitoring device to record the speech signals. These observations were collected from 42 patients. Each row represents one of 5,875 voice recordings from these individuals. 
+
+The telemonitoring process conducted for this data set on early-stage Parkinson's patients is composed of a range of biomedical voice measurements from a telemonitoring device for remote symptom progression monitoring. The recordings were automatically captured in the patient's homes. 
+
+##A. Attribute Information
+
+* **subject** - Integer that uniquely identifies each subject 
+* **age** - Subject age 
+* **sex** - Subject gender '0' - male, '1' - female 
+* **test_time** - Time since recruitment into the trial. The integer part is the number of days since recruitment. 
+* **motor_UPDRS** - Clinician's motor UPDRS score, linearly interpolated 
+* **total_UPDRS** - Clinician's total UPDRS score, linearly interpolated 
+* **Jitter(%),Jitter(Abs),Jitter:RAP,Jitter:PPQ5,Jitter:DDP** - Several measures of variation in fundamental frequency 
+* **Shimmer,Shimmer(dB),Shimmer:APQ3,Shimmer:APQ5,Shimmer:APQ11,Shimmer:DDA** - Several measures of variation in amplitude 
+* **NHR,HNR** - Two measures of ratio of noise to tonal components in the voice 
+* **RPDE** - A nonlinear dynamical complexity measure 
+* **DFA** - Signal fractal scaling exponent 
+* **PPE** - A nonlinear measure of fundamental frequency variation
+  
+##B. Goal of Project
+  
+I will use this data set and the predictor variables in it to create a predictive model to compute the motor unified Parkinson's disease rating scale (UPDRS) of a patient based on several, if not all, of the above predictors.
+  
+# III. Exploratory Data Analysis
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+library(RCurl)
+library(reshape2)
+library(ggplot2)
+library(corrplot)
+library(leaps)
+library(glmnet)
+library(MASS)
+library(tree)
+library(randomForest)
+
+# Load and clean data (change column names) 
+data.park <- read.csv(text = getURL("https://archive.ics.uci.edu/ml/machine-learning-databases/parkinsons/telemonitoring/parkinsons_updrs.data"))
+head(data.park)
+names(data.park)[names(data.park) == 'Jitter...'] <- 'Jitter(%)'
+names(data.park)[names(data.park) == 'Jitter.Abs.'] <- 'Jitter(Abs)'
+names(data.park)[names(data.park) == 'Shimmer.dB.'] <- 'Shimmer(dB)'
+
+# Data exploration 
+data.park.cols.1 <- data.park[,2:14]
+data.park.cols.2 <- data.park[,15:21]
+ggplot(melt(data.park.cols.1),aes(x = value)) + 
+   facet_wrap(~variable,scales = "free_x") + 
+   geom_histogram()
+ggplot(melt(data.park.cols.2),aes(x = value)) + 
+  facet_wrap(~variable,scales = "free_x") + 
+  geom_histogram()
+```
+
+The histograms show that the 'Jitter' and 'Shimmer' variables have very right-skewed distributions, while HNR and RPDE seem to be the only variables with a distribution that appears to be like a bell-shaped curve. HNR is a ratio of noise to tonal components in the voice, and RPDE is a nonlinear dynamical complexity measure. Another important measure to note is that there are about twice as many male patients in the data set as there are females, as reflected in the histogram for the 'sex' predictor variable.
+  
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Plot correlations between predictors 
+corrplot(cor(data.park[,2:ncol(data.park)]), type="upper")
+```
+
+Based on the correlogram, it is evident that the 'Jitter' and 'Shimmer' variables are positively correlated with each other. They are also positively correlated with PPE. This makes sense since the 'Jitter' features represent several measures of variation in fundamental frequency, the 'Shimmer' features measure variations in amplitude, and PPE is a nonlinear measure of fundamental frequency variation. So as expected, all variables related to the frequency and amplitude of the biomedical voice measures contribute to the outcome of the motor UPDRS.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Convert 'sex' to factor
+data.park$sex <- factor(data.park$sex, levels = c("0", "1"),
+                        labels = c("Male", "Female"))
+
+# Drop 'subject' column
+data.park <- data.park[-1]
+
+# Standardize data
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+data.park.norm <- as.data.frame(lapply(data.park[c(1, 3, 5:21)], normalize))
+data.park.norm$sex <- data.park$sex
+data.park.norm$motor_UPDRS <- data.park$motor_UPDRS
+
+```
+
+# IV. Methods
+
+Before modeling, I split the normalized data into a training set and a validation set, where 75% of the entries are the training set and the other 25% make up the validation set.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Divide into training set and test set
+seed.num <- which(letters == "r") + which(letters == "k")
+set.seed(seed.num)
+train <- sample(1:dim(data.park)[1], (dim(data.park)[1]/4)*3)
+test <- -train
+data.park.train <- data.park.norm[train,]
+data.park.test <- data.park.norm[test,]
+```
+
+## A. Multiple Linear Regression
+
+If we have training data ${(x_1, y_1), ..., (x_n, y_n)}$, where $y_i$ is quantitative, we would want to estimate the regression function $f(X) = E(Y|X)$. 
+
+To fit the relationship between a quantitative response $Y$ and a set of variables $X_1, ..., X_p$, multiple linear regression is considered, where Y is modeled using:
+
+$$Y = B_0 + B_1X_1 + ... + B_pX_p + \epsilon$$
+
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Perform linear regression
+fit.linear.1 <- lm(motor_UPDRS~. - total_UPDRS, data=data.park.train)
+
+```
+Since there are several predictors in this data set, it is evident that some of these will most likely be removed some of them from the model. The best subset selection method was conducted here to understand which variables would make for the best linear regression model.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+best.subsets <- regsubsets(motor_UPDRS~. - total_UPDRS, data=data.park.train)
+subsets.summary <- summary(best.subsets)
+
+par(mfrow=c(1,3))
+plot(subsets.summary$cp, xlab = "# of Predictors", ylab = "Cp", type = "l")
+cp.best <- min(subsets.summary$cp)
+points(c(1:10)[subsets.summary$cp == cp.best], cp.best, pch=2, col="red")
+abline(v = c(1:10)[subsets.summary$cp == cp.best], lwd=1, lty=2, col="red")
+
+plot(subsets.summary$bic, xlab = "# of Predictors", ylab = "BIC", type = "l")
+bic.best <- min(subsets.summary$bic)
+points(c(1:10)[subsets.summary$bic == bic.best], bic.best, pch=2, col="red")
+abline(v = c(1:10)[subsets.summary$bic == bic.best], lwd=1, lty=2, col="red")
+
+plot(subsets.summary$adjr2, xlab = "# of Predictors", ylab = "Adjusted R Squared", type = "l")
+adjr2.best <- max(subsets.summary$adjr2)
+points(c(1:10)[subsets.summary$adjr2 == adjr2.best], adjr2.best, pch=2, col="red")
+abline(v = c(1:10)[subsets.summary$adjr2 == adjr2.best], lwd=1, lty=2, col="red")
+title("Best Subset Selection", outer = TRUE, line=-1)
+```
+
+According to the best subset selection method, it is advised to consider the 8 predictor model for our prediction on motor UPDRS. This 8 predictor model contains the variables, where $B_i, i = 0 - (p-1)$ represents the intercept and coefficients for the predictors in the model:
+$$motor UPDRS = B_0 + B_1age + B_2test time + B_3Jitter(Abs) + B_4Shimmer:APQ5$$ $$+ B_5Shimmer:APQ11 + B_6HNR + B_7DFA + B_8PPE$$
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+fit.linear.best <- lm(motor_UPDRS ~ age + test_time + Jitter.Abs. + Shimmer.APQ5 + Shimmer.APQ11 + HNR + DFA + PPE, data=data.park.train)
+residual.std.error <- summary(fit.linear.best)[[6]]
+
+par(mfrow=c(1,2))
+plot(fit.linear.best, which=c(2,1))
+```
+
+Based on the residual plots, there is a lack of normality in the residuals. The residuals do not assemble around the residuals = 0 line; instead they form a cloud where they vary from anywhere from 0 to 20. The normal Q-Q plot also has tails curve off from very close to the middle of the line, showing a major departure of the residuals from normality.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+linear.pred <- predict(fit.linear.best, data.park.test, type="response")
+linear.SSE <- sum((data.park.test$motor_UPDRS - linear.pred) ^ 2)
+linear.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+linear.r.squared <- 1 - linear.SSE/linear.SST
+linear.mse <- mean(fit.linear.best$residuals^2)
+
+```
+
+See Section V. Analysis for linear regression prediction results.
+
+## B. Ridge Regression
+
+After noticing that multiple linear regression did not predict the test data very accurately, even after using the best subsets model, I resorted to using a statistical learning method that takes multicollinearity of the predictors into account. 
+
+Looking back at my exploratory data analysis, where I noticed a lot of the predictor variables being strongly correlated with each other, I realized that this may be affecting the predictions of motor UPDRS. To strengthen my model, I needed a tuning parameter to shrink the coefficients towards zero, and ridge regression is a method that performs this shrinkage. 
+
+In ridge regression, the set of parameters is computed by minimizing over a constrained parameter space: 
+
+$$ (\hat{\beta}_0, \hat{\beta}_1, ... \hat{\beta}_p) = \underset{{\beta}_0, {\beta}_1, ... {\beta}_p}{\operatorname{argmin}} [\sum_{i=1}^n (y_i - \beta_0 - \sum_{j=1}^p \beta_jx_{ij})^2 + \lambda \sum_{j=1}^p {\beta_j}^2]  $$
+
+It selects the optimal value of $\lambda$ (the tuning parameter) using cross-validation. When $\lambda = 0$, the penalty term has no effect on the model and so the ridge regression simply produces the least square estimates. When $\lambda$ -> $\infty$, the impact of the shrinkage penalty grows, bringing the ridge regression coefficient estimates closer to zero. For each value of ${\hat{\beta}_{\lambda}}^R$, ridge regression will produce a different set of coefficient estimates. However, we are only interested in the coefficient estimates from the minimized value of lambda: 
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+train.matrix <- model.matrix(motor_UPDRS ~ . - total_UPDRS, data = data.park.train)
+test.matrix <- model.matrix(motor_UPDRS ~ . - total_UPDRS, data = data.park.test)
+grid <- 10 ^ seq(4,-2,length=100)
+
+ridge.model <- cv.glmnet(train.matrix, data.park.train$motor_UPDRS, alpha = 0, lambda=grid, thresh=1e-12)
+lambda.best <- ridge.model$lambda.min
+coef(ridge.model)[,1]
+```
+
+For our Ridge regression model, the best value of $\lambda$ is `r lambda.best`.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+ridge.pred <- predict(ridge.model, newx = test.matrix, s = lambda.best)
+ridge.mse <- mean((data.park.test$motor_UPDRS - ridge.pred)^2)
+
+ridge.SSE <- sum((data.park.test$motor_UPDRS - ridge.pred) ^ 2)
+ridge.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+ridge.r.squared <- 1 - ridge.SSE/ridge.SST
+
+```
+
+See Section V. Analysis for ridge regression prediction results.
+
+## C. LASSO Regression
+
+In ridge regression, the coefficients ${\hat{\beta}_{\lambda}}^L$ are defined as $$ (\hat{\beta}_0, \hat{\beta}_1, ... \hat{\beta}_p) = \underset{{\beta}_0, {\beta}_1, ... {\beta}_p}{\operatorname{argmin}} [\sum_{i=1}^n (y_i - \beta_0 - \sum_{j=1}^p \beta_jx_{ij})^2 + \lambda \sum_{j=1}^p |{\beta_j}|]  $$. 
+
+Cross-validation is used here as well to compute the optimal value of lambda.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Perform lasso regression
+data.park.train$sex <- as.numeric(data.park.train$sex)
+data.park.test$sex <- as.numeric(data.park.test$sex)
+X.all <- as.matrix(data.park.train[, c(1:2, 4:20)])
+Y <- as.matrix(data.park.train[21])
+
+# Use CV to select the optimal value of lambda
+lasso.cv <- cv.glmnet(X.all, Y, alpha=1)
+plot(lasso.cv)
+
+```
+
+For our LASSO regression model, the best value of $\lambda$ is `r lasso.cv$lambda.min`.
+
+The following are the coefficients yielded by the LASSO regression:
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+lasso.model <- glmnet(X.all, Y, alpha=1, lambda=lasso.cv$lambda.min)
+coef(lasso.model)[,1]
+
+```
+
+Since Jitter:PPQ5, Shimmer, and Shimmer(dB) have coefficients of 0, this implies that these three measurements of amplitude do not hold as much significance to the model or to the motor UPDRS score.
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+lasso.pred <- predict.glmnet(lasso.model, as.matrix(data.park.test[, c(1:2, 4:20)]), s = lasso.cv$lambda.min, type = "response")
+lasso.mse <- mean((data.park.test$motor_UPDRS - lasso.pred)^2)
+
+lasso.SSE <- sum((data.park.test$motor_UPDRS - lasso.pred) ^ 2)
+lasso.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+lasso.r.squared <- 1 - lasso.SSE/lasso.SST
+
+```
+
+See Section V. Analysis for LASSO regression prediction results.
+
+## D. Regression with Decision Trees
+
+Decision trees are used to divide the predictor space into several distinct and non-overlapping regions $R_1, R_2, ..., R_J$. For every observation that falls into the region $R_j$, we use the mean of the response values for the training observations in $R_j$ to make the same prediction. The regions are split using recursive binary splitting, and the goal is to find boxes $R_1, R_2, ..., R_J$ that minimize
+
+$$RSS =  \sum_{j=1}^J\sum_{i\varepsilon R_j}(y_i - {\bar{y}_R}_j)^2$$
+
+
+
+```{r fig.width=8, fig.height=6, warning=FALSE, message=FALSE, echo=FALSE}
+
+tree.motor <- tree(motor_UPDRS ~ . - total_UPDRS, data.park.train)
+plot(tree.motor)
+text(tree.motor, cex=0.75)
+title("Decision Tree to Predict 'motor_UPDRS'")
+decision.pred <- predict(tree.motor, data.park.test, type="vector")
+decision.SSE <- sum((data.park.test$motor_UPDRS - decision.pred) ^ 2)
+decision.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+decision.r.squared <- 1 - decision.SSE/decision.SST
+decision.mse <- mean((data.park.test$motor_UPDRS - decision.pred)^2)
+
+```
+
+This decision tree was constructed based on the standardized versions of the predictor variables. It primarily uses age and DFA, and also uses Jitter(Abs) and sex to distinguish within lower branches.
+
+See Section V. Analysis for Decision tree prediction results.
+
+## E. Regression with Random Forests/Bagging
+
+Using random forests, a number of decision trees are built; each time a split in a tree is considered, random forests use a random sample of $m$ predictors from the full set of $p$ predictors.
+
+I initially decided to run a random forest model on the data with the default parameters, which came out to be an average of 500 trees with 6 variables chosen at each split.  
+
+```{r fig.width=8, fig.height=6, warning=FALSE, message=FALSE, , echo=FALSE}
+
+forest.motor <- randomForest(motor_UPDRS ~ . - total_UPDRS, data.park.train)
+forest.motor
+
+forest.pred <- predict(forest.motor, data.park.test)
+forest.SSE <- sum((data.park.test$motor_UPDRS - forest.pred) ^ 2)
+forest.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+forest.r.squared <- 1 - forest.SSE/forest.SST
+forest.mse <- mean((data.park.test$motor_UPDRS - forest.pred)^2)
+
+plot(forest.motor)
+```
+
+This model gave a mean squared error of `r forest.mse` and an $R^2$ value of `r forest.r.squared`.
+
+Then I decided to set $m$ equal to $p = 19$ to see what kinds of results come out of the prediction. (Setting $m$ equal to $p$ is called bagging.) Then I grew 400 trees with all 19 predictors. 
+
+```{r fig.width=8, fig.height=6, warning=FALSE, message=FALSE, echo=FALSE}
+
+oob.err=double(19)
+test.err=double(19)
+
+# mtry is no of Variables randomly chosen at each split
+for(mtry in 1:19)
+{
+  bagging.motor <- randomForest(motor_UPDRS ~ . - total_UPDRS, data = data.park.train, mtry=mtry,ntree=400)
+  oob.err[mtry] = bagging.motor$mse[400] #Error of all Trees fitted
+
+  pred <- predict(bagging.motor, data.park.test) #Predictions on Test Set for each Tree
+  test.err[mtry]= with(data.park.test, mean( (data.park.test$motor_UPDRS - pred)^2)) #Mean Squared Test Error
+
+  cat(mtry," ") #printing the output to the console
+ }
+
+# Test Error
+# test.err
+
+# Out-of-bag Estimation
+# oob.err
+
+bagging.pred <- pred
+bagging.SSE <- sum((data.park.test$motor_UPDRS - bagging.pred) ^ 2)
+bagging.SST <- sum((data.park.test$motor_UPDRS - mean(data.park.test$motor_UPDRS)) ^ 2)
+bagging.r.squared <- 1 - bagging.SSE/bagging.SST
+bagging.mse <- mean((data.park.test$motor_UPDRS - bagging.pred)^2)
+
+# So here we are growing 400 trees for 19 times (for all 19 predictors).
+
+matplot(1:mtry , cbind(oob.err,test.err), pch=19 , col=c("red","blue"),type="b",ylab="Mean Squared Error",xlab="Number of Predictors Considered at each Split")
+legend("topright",legend=c("Out of Bag Error","Test Error"),pch=19, col=c("red","blue"))
+
+```
+
+Based on the error plot for the bagging approach, the error tends to be minimized at adding all 19 variables. Furthermore, with bagging, our model has a mean squared error of `r bagging.mse` and an $R^2$ value of `r bagging.r.squared`. 
+
+# V. Results and Analysis
+
+Model | MSE | R^2 
+------------- | ------------- | ------------- 
+Linear Regression | `r linear.mse` | `r linear.r.squared`
+Ridge Regression | `r ridge.mse` | `r ridge.r.squared`
+LASSO Regression | `r lasso.mse` | `r lasso.r.squared`
+Decision Tree | `r decision.mse` | `r decision.r.squared`
+Random Forest without Bagging | `r forest.mse` | `r forest.r.squared`
+Random Forest with Bagging | `r bagging.mse` | `r bagging.r.squared`
+
+
+The table above discusses the results from each of the models. 
+
+* Based on the measures of mean squared error and R-squared, it is clear that Random Forest regression   with Bagging outperforms the rest of the models in terms of its prediction results. 
+
+* Following the Random Forest regression models in prediction accuracy is the Decision Tree model, which has an R-squared value of `r decision.r.squared`. Although the Decision Tree model was not the most accurate of them all, it still delivered results that were far better than those of the other three linear models. This is because decision trees do a better job of capturing the non-linearity in the data by dividing the space into smaller sub-spaces. 
+
+* Ridge regression did not work as well because it does not zero out coefficients; rather it minimizes their impacts on the trained model, even if some variables hold little to no significance to the response. 
+
+* LASSO regression takes care of parameter shrinkage and variable selection automatically, allowing coefficients of zero for variables that are not deemed significant to the response. However, the tuning parameter still does not capture much of the non-linearity in the data. 
+
+* So it is apparent that there is a lot of non-linearity present, and decision trees and random forests account for this non-linearity. Random forests are especially useful for being able to model complicated relations in the data, because they are built by averaging several trees (400 in this case) and they classify the data into rectangular chunks. 
+
+# VI. Conclusions
+
+Based on this data set containing observations from telemonitoring on patients with Parkinson's, we can accurately predict the motor unified Parkinson's disease rating scale (UPDRS) of a patient using a Random Forest regressor with all 19 predictors; this model has an R-squared value of `r bagging.r.squared`. Since the goal was to accurately predict motor UPDRS, prediction accuracy and measures of MSE and $R^2$ took precedence over variable selection and returning a sparse basis, and this explains why the non-linear models (decision trees, random forests) performed significantly better than the linear models (multiple linear regression, ridge regression, LASSO regression). 
+
+# VII. Sources
+* https://archive.ics.uci.edu/ml/datasets/parkinsons+telemonitoring
+* http://www.parkinson.org/understanding-parkinsons/what-is-parkinsons
+* https://en.wikipedia.org/wiki/Unified_Parkinson%27s_disease_rating_scale
+* https://www.neuraldesigner.com/blog/telemonitoring-of-patients-with-parkinsons-disease
